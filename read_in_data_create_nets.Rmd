@@ -1,0 +1,500 @@
+```{r}
+install.packages("tidyverse")
+install.packages("googlesheets4")
+install.packages("statnet")
+```
+
+
+```{r}
+library(googlesheets4)
+library(tidyverse)
+library(statnet)
+```
+
+## Read in data from google sheets
+
+
+```{r}
+gs4_deauth()
+cleaner_name_data <-
+  read_sheet(
+    "https://docs.google.com/spreadsheets/d/1mS9ZOdOhL7Z0ANILpuyGnKzGsp1246THDbBfWLNVraI/edit#gid=1496824528",
+    3
+  )
+hosts_data <-
+  read_sheet(
+    "https://docs.google.com/spreadsheets/d/1FTaTG3PryNbT1FnJzDftk2OpPzFtXdoe8KeNFxxb7AY/edit#gid=2083608928",
+    2
+  )
+rs_data <-
+  read_sheet(
+    "https://docs.google.com/spreadsheets/d/1mS9ZOdOhL7Z0ANILpuyGnKzGsp1246THDbBfWLNVraI/edit#gid=603853676",
+    5
+  )
+
+#reading in then cleaning host data
+hosts_data_long <- hosts_data %>%
+  separate_longer_delim(c("host", "gender"), delim = ", ")
+
+#Making everything lowercase
+hosts_data_long$host <- tolower(hosts_data_long$host)
+
+#overwriting names_combined with real_name, then renaming column to final name
+name_data <- cleaner_name_data %>%
+  mutate(final_name = coalesce(real_name, names_combined))
+
+#selecting cols of interest
+static_name_data_skinny <- name_data %>%
+  select("Show.Name", "final_name", "Full.Date") %>%
+  left_join(., hosts_data, by = c("Show.Name" = "show")) %>%
+  select("Show.Name", "final_name", "political_leaning", "Full.Date") %>%
+  rename("Partisan.Leaning" = "political_leaning")
+
+#renaming columns of host_data_long for anti join
+colnames(hosts_data_long) <- c(
+  "Show.Name",
+  "final_name",
+  "Partisan.Leaning",
+  "Network",
+  "guessed_gender",
+  "Men.Only",
+  "Top.Misinfo",
+  "category",
+  "show_age_months",
+  "episode_days_per_month",
+  "end_date",
+  "start_date",
+  "followers_twitter",
+  "twitter_handles",
+  "show_handle",
+  "lean2"
+)
+
+## Read in and clean the gender data
+static_name_data_skinny_cleaner <-
+  anti_join(static_name_data_skinny,
+            hosts_data_long,
+            by = c("Show.Name", "final_name"))
+
+# Read in data from Google Sheets
+gs4_deauth() #making sure I have read permissions straightened out
+static_names <- read_sheet("https://docs.google.com/spreadsheets/d/13IWciS_cxNLqlZMoYSsmdvCNnU70x2-wWIp1B4Ktw3U/edit#gid=1035186801")
+
+#Extracting then cleaning the first name of guests
+static_name_data_skinny_cleaner$name <-
+  str_extract(static_name_data_skinny_cleaner$final_name, regex('^\\S*')) %>%
+  trimws()
+
+#Merging data with the edgelist, reordering columns to develop digraph
+static_name_data_skinny_cleaner_p <-
+  left_join(static_name_data_skinny_cleaner,
+            static_names,
+            by = c("name")) %>%
+            drop_na(., final_name) %>% 
+            group_by_all(.) %>%
+            count(.) %>% 
+          rename(weights=n) %>% unique(.) %>%
+  .[c(2, 1, 3, 5, 6, 4, 7)] 
+
+static_name_data_skinny_cleaner_p[is.na(static_name_data_skinny_cleaner_p$guessed_gender), 5] <- "male" #need to manually code in one missing data point!
+```
+
+## Read in data on government officials
+
+
+```{r}
+combined_governments <- read.csv("/home/sdemets/combined_governments.csv") %>% select(-c('X'))
+congress_complete <- read.csv("/home/sdemets/congress_complete.csv") %>% select(-c('X'))
+```
+
+## Generate covariates on data
+Below, we add:
+- a unique **vertex id** on guests and shows in order to clearly identify who is who, which makes adding other attributes easier down the line.
+- **node type** for later use, indicating if a particular node is a show or a guest. 
+- Redundantly, **is actor**, for statnet (do not worry about this one).
+- **is host**, to indicate if a given guest hosts their own podcast (and if the podcast is one of the shows in this dataset).
+- **gender**, which is unfortunately only binary. For guests where gender cannot be estimated based on the name, gender is listed as unknown.
+- **politics**. For individuals whose name match those of any federal officials, cabinet members (elected or not) in congress from 2012 to 2024. Likewise, governors and lieutenant governors are included.
+- **partisan leaning** of the shows in question. These were taken from the accompanying Brookings set. Any unknowns were modified. Libertarian shows were listed as more conservative.
+- The **number of followers** a given show or show host has on Twitter (now X).
+- **Repeat spreader** whether a specific __guest__ has been identified by the CiP as a repeat spreader of election disinformation. For shows, we picked the top 8 offenders listed by the Brookings institute.
+- **Episode frequency** the number of shows released per month, to control for variation between shows that release say daily, twice per week, or other.
+
+
+```{r}
+### vID #####################################################################
+guest_ID <- unique(static_name_data_skinny_cleaner_p$final_name)
+show_ID <- unique(hosts_data$show)
+vID <- c(guest_ID, show_ID)
+
+### node_type #####################################################################
+guests <- rep("guest", length(guest_ID))
+shows <- rep("show", length(show_ID))
+node_type <- c(guests, shows)
+
+### is_actor #####################################################################
+is_actor <- node_type == "guest"
+static_bip_nodes <- data.frame(vID, node_type, is_actor)
+
+### is_host #####################################################################
+hosts_data_long_cov <-
+  hosts_data_long[str_detect(hosts_data_long$final_name, " "), ] %>%
+  select("final_name", "Partisan.Leaning")
+hosts_data_long_cov$final_name <-
+  trimws(hosts_data_long_cov$final_name)
+hosts_data_long_cov_DUMMY <-
+  hosts_data_long_cov[str_detect(hosts_data_long_cov$final_name, " "), 1] %>%
+  unique(.)
+hosts_data_long_cov_DUMMY$is_host <- "TRUE"
+static_bip_nodes <- left_join(static_bip_nodes,
+                              hosts_data_long_cov_DUMMY,
+                              by = c("vID" = "final_name"))
+
+static_bip_nodes[is.na(static_bip_nodes$is_host), 4] <- FALSE
+
+### gender_cov #####################################################################
+vID_merger <- static_bip_nodes %>%
+  select(1) %>%
+  data.frame(.)
+static_name_data_skinny_cleaner_gender <-
+  static_name_data_skinny_cleaner_p[c("final_name", "guessed_gender")] %>%
+  unique(.)
+
+show_gender <- left_join(vID_merger,
+                         hosts_data,
+                         by = c("vID" = "show"))[[6]] %>%
+  .[!is.na(.)]
+
+
+
+guest_gender <- left_join(vID_merger,
+                          static_name_data_skinny_cleaner_gender,
+                          by = c("vID" = "final_name"))[[2]] %>%
+  .[!is.na(.)]
+
+static_bip_nodes$gender <- c(guest_gender, show_gender)
+
+### politics ############################################################################
+combined_governments_names <- combined_governments[c(1:2)]
+
+long_names_political_affiliations <- rbind(hosts_data_long_cov,
+                                           combined_governments_names,
+                                           congress_complete) %>%
+  unique(.) %>% 
+  .[!is.na(.$Partisan.Leaning), ]
+
+duplicate_names <- long_names_political_affiliations %>%
+  group_by(final_name) %>%
+  count(final_name) %>% 
+  filter(n > 1)
+
+duplicate_names <- long_names_political_affiliations %>%
+  group_by(final_name) %>%
+  count(final_name) %>% 
+  filter(n > 1)
+
+duplicated_pols <-
+  semi_join(long_names_political_affiliations,
+            duplicate_names,
+            by = c("final_name")) %>%
+  arrange(final_name) %>%
+  select(final_name) %>%
+  unique(.)
+
+duplicated_pols$Partisan.Leaning <-
+  c(
+    "More Liberal",
+    "More Liberal",
+    "More Conservative",
+    NA,
+    "More Conservative",
+    "More Conservative",
+    "More Liberal",
+    "More Conservative",
+    "More Conservative",
+    "More Conservative",
+    "More Conservative",
+    "More Conservative",
+    "Moderate",
+    "More Conservative",
+    "More Conservative",
+    "More Conservative",
+    "More Liberal",
+    "More Conservative",
+    "More Conservative"
+  )
+
+duplicated_pols <- drop_na(duplicated_pols)
+long_names_political_affiliations_cleaned <-
+  anti_join(long_names_political_affiliations,
+            duplicated_pols,
+            by = c("final_name")) %>%
+  rbind(., duplicated_pols)
+
+#grab the political leaning of the show
+show_political <- left_join(vID_merger,
+                            hosts_data,
+                            by = c("vID" = "show"))[[3]] %>%
+  .[!is.na(.)]
+
+#grab the political leaning  of the guest
+guest_political <- left_join(vID_merger,
+                             long_names_political_affiliations_cleaned,
+                             by = c("vID" = "final_name"))[[2]] %>%
+  head(.,-(length(show_political)))
+static_bip_nodes$political_leaning <-
+  c(guest_political, show_political) %>%
+  replace_na("unknown")
+
+#### Adding Repeat Spreader ID ###################
+show_rs <-
+  hosts_data[c(1, 7)]
+static_bip_guest <-
+  static_bip_nodes[static_bip_nodes$node_type == "guest", ]
+static_bip_show <-
+  static_bip_nodes[static_bip_nodes$node_type == "show", ]
+
+rs_guest <-
+  left_join(static_bip_guest, rs_data, by = c("vID" = "name")) %>%
+  dplyr::mutate(is_rs = replace_na(is_rs, "no")) %>%
+  select(is_rs)
+
+rs_show <- left_join(static_bip_show, show_rs,
+                     by = c("vID" = "show")) %>%
+  rename(is_rs = "in_AR_OR_RS") %>%
+  dplyr::mutate(is_rs = replace_na(is_rs, "no")) %>%
+  select(is_rs)
+
+is_misinfo_rs <- bind_rows(rs_guest, rs_show)
+static_bip_nodes <- bind_cols(static_bip_nodes, is_misinfo_rs)
+
+##### Adding Episode Frequency per Month ##############
+guest_frequency <- rep(NA, length(guest_ID))
+ep_freq <-
+  static_bip_nodes %>%
+  filter(is_actor == "FALSE") %>%
+  left_join(., hosts_data, by = c("vID" = "show")) %>%
+  select(episode_days_per_month)
+sf <- c(guest_frequency, ep_freq$episode_days_per_month)
+static_bip_nodes$ep_freq <- sf
+
+##### Adding Number of Followers #######
+host_l <- rep(NA, length(guest_ID))
+host_followers <- static_bip_nodes %>%
+  filter(is_actor == "FALSE") %>%
+  left_join(., hosts_data, by = c("vID" = "show")) %>%
+  select(followers)
+hf <- c(host_l, host_followers$followers)
+static_bip_nodes$host_followers <- hf
+```
+
+## Create the bipartite network of shows and guests. Additionally, create a one mode network of the same data.
+
+
+```{r}
+### Create edgelist
+static_bip_edges <- static_name_data_skinny_cleaner_p %>%
+                    ungroup(.) %>% 
+                    select(1,2,3,5) %>%
+                    rename(actor = final_name, 
+                           event = Show.Name) %>%
+                     unique(.)
+
+# create bipartite net
+static_bip_net <- as.network(static_bip_edges,
+  directed = FALSE, vertices = static_bip_nodes,
+  bipartite = TRUE, multiple = FALSE
+)
+
+# create one mode net
+omp <- as.network(static_bip_edges,
+  directed = TRUE, vertices = static_bip_nodes, multiple = FALSE
+)
+```
+
+## Create the show/show projection of at least 1 common guest, then 2 common guests, then cross-cutting guests.
+
+
+```{r}
+coengaged_hosts <- static_name_data_skinny_cleaner %>%
+  group_by(final_name) %>%
+  expand(Show.Name, Show.Name) %>%
+  .[.$Show.Name...1 != .$Show.Name...2,] %>%
+  ungroup(.) %>% 
+  drop_na(.) %>% 
+  relocate(2,3,1) %>%
+  group_by(Show.Name...1, Show.Name...2) %>% 
+  summarize(final_name = paste0(final_name, collapse = ", "))
+
+
+#Deleting duplicated edges
+coengaged_hosts$temp <- apply(coengaged_hosts, 1, function(x) paste(sort(x), collapse=""))
+coengaged_hosts <- coengaged_hosts[!duplicated(coengaged_hosts$temp), 1:3]
+
+#converting edgelist to network, then adding missing vertices                              
+static_host_projection <- network(coengaged_hosts, matrix.type = "edgelist", directed = FALSE, multiple = FALSE)
+missing_nodes <- setdiff((unique(hosts_data$show)), (static_host_projection%v%'vertex.names'))
+static_host_projection <- add.vertices(static_host_projection, length(missing_nodes))
+
+#Adding vertex names to missing vertices                              
+missing_node_ids <- which(is.na(static_host_projection%v%"vertex.names"))
+for(i in 1:length(missing_node_ids)){
+    set.vertex.attribute(static_host_projection, "vertex.names", missing_nodes[[i]], missing_node_ids[i])
+    } 
+```
+
+
+```{r}
+#This is almost the exact same process as above, just run on filtered data from the first step
+coengaged_hosts_2 <- static_name_data_skinny_cleaner %>%
+  group_by(final_name) %>%
+  expand(Show.Name, Show.Name) %>%
+  .[.$Show.Name...1 != .$Show.Name...2,] %>%
+  select(-c(final_name)) %>%
+  ungroup(.) %>% 
+  drop_na(.) %>%  
+  select(-c(final_name)) %>%
+  group_by_all(.) %>% count(.) %>%
+  filter(n>1) %>% #selecting for guests who have appeared more than once
+  select(-c(n))
+
+#getting rid of duplicated edges then adding missing vertices
+coengaged_hosts_2$temp <- apply(coengaged_hosts_2, 1, function(x) paste(sort(x), collapse=""))
+coengaged_hosts_2 <- coengaged_hosts_2[!duplicated(coengaged_hosts_2$temp), 1:2]                            
+static_host_projection2 <- network(coengaged_hosts_2, matrix.type = "edgelist", directed = FALSE, multiple = FALSE)
+                                
+#Add missing vertices and their corresponding names                                
+missing_nodes2 <- setdiff((unique(hosts_data$show)), (static_host_projection2%v%'vertex.names'))
+static_host_projection2 <- add.vertices(static_host_projection2, length(missing_nodes2))                            
+missing_node_ids2 <- which(is.na(static_host_projection2%v%"vertex.names"))
+                                
+for(i in 1:(length(missing_node_ids2))){
+    set.vertex.attribute(static_host_projection2, "vertex.names", missing_nodes2[[i]], missing_node_ids2[i])
+    }
+```
+
+
+```{r}
+coengaged_hosts_mismatches <- left_join(coengaged_hosts,
+                                        hosts_data,
+                                        by = c("Show.Name...1" = "show")) %>%
+  select(c(1, 2, 3, 4, 5, 6))
+
+coengaged_hosts_mismatches <- left_join(coengaged_hosts_mismatches,
+                                        hosts_data,
+                                        by = c("Show.Name...2" = "show")) %>%
+  filter(political_leaning.x != political_leaning.y) %>%
+  select(c(1, 2, 3))
+
+bridge_guests <- data.frame(coengaged_hosts_mismatches) %>%
+  separate_longer_delim(3, delim = ", ") %>%
+  group_by_all(.) %>%
+  count(.) %>% 
+  ungroup(.) %>% 
+  unique(.)
+
+bridge_guests$Show <- paste(bridge_guests$Show.Name...1,
+        bridge_guests$Show.Name...2,
+        sep = "_")
+
+mm_projection <- bridge_guests %>% 
+    select(c("Show.Name...1",
+             "Show.Name...2",
+             "final_name")) %>% 
+    network(., 
+            matrix.type = "edgelist", 
+            directed = FALSE, 
+            multiple = TRUE)
+```
+
+
+```{r}
+############ adding covariates to the complete show/show coengagement network ###############
+add_show_show_cov <- function(g){
+    host_coengaged_shows_names <- data.frame(show = g%v%'vertex.names')
+    host_leaning_data <- hosts_data %>% select(-c(host))
+    host_leaning_data_full <- inner_join(host_coengaged_shows_names, 
+                                         host_leaning_data, by = c("show"))
+    g%v%'partisan_leaning' <- host_leaning_data_full$political_leaning
+    g%v%'network' <- host_leaning_data_full$Network
+    g%v%'gender' <- host_leaning_data_full$only_men
+    g%v%'top_misinfo' <- host_leaning_data_full$in_AR
+    g%v%'category' <- host_leaning_data_full$category
+    g%v%'show_age' <- host_leaning_data_full$show_age_months
+    g%v%'episode_frequency' <- host_leaning_data_full$episode_days_per_month
+    g%v%'followers' <- host_leaning_data_full$followers
+    return(g)
+    }
+
+static_host_projection <- add_show_show_cov(static_host_projection)
+static_host_projection2 <- add_show_show_cov(static_host_projection2)
+mm_projection <- add_show_show_cov(mm_projection)
+```
+
+## Write data to files in networks
+
+
+```{r}
+write.csv(static_name_data_skinny_cleaner_p, "/home/sdemets/Apple_Podcast_Political_Data/network_data/full_network_dataframe.csv")
+saveRDS(static_bip_net, "/home/sdemets/Apple_Podcast_Political_Data/network_data/static_bip.rds")
+saveRDS(static_host_projection, "/home/sdemets/Apple_Podcast_Political_Data/network_data/static_host_projection.rds")
+saveRDS(mm_projection, "/home/sdemets/Apple_Podcast_Political_Data/network_data/mm_projection.rds")
+```
+
+## Update specific file
+This is needed to run if I have updated/cleaned any of the Apple guests data.
+
+
+```{r}
+#Define the file(s) that you want to update
+fn <- "/home/sdemets/Apple_Podcast_Political_Data/network_data/full_network_dataframe.csv"
+#Check its existence
+if (file.exists(fn)) {
+    #Delete file if it exists
+    file.remove(fn)
+}
+```
+
+## DO NOT RUN! Code used to generate the gender data.
+Partially commented out so it doesn't work.
+
+```{r}
+#remotes::install_github("lmullen/genderdata")
+#install.packages("gender")
+#library(gender)
+#library(genderdata)
+
+#Extracting then cleaning the first name of guests
+#static_name_data_skinny_cleaner$name <-
+  str_extract(static_name_data_skinny_cleaner$final_name, regex('^\\S*')) %>%
+  trimws()
+
+print("Done!")
+# Get unique names then rename column
+#static_names <-
+  #data.frame(unique(static_name_data_skinny_cleaner$name)) %>%
+  rename("name" = "unique.static_name_data_skinny_cleaner.name.")
+
+print("Done!")
+#Generating an empty variable to fill
+guessed_gender <- rep("unknown", nrow(static_names))
+
+print("Done!")
+
+#For loop to ID gender using the gender package.
+for (i in 1:nrow(static_names)) {
+  print(i)
+  tryCatch({
+    print(i)
+    guessed_gender[[i]] <- gender(static_names[[i, 1]], countries = c("United States"))[[4]]
+    print(i)
+  #},
+  error = function(e) {
+    print(i)
+    guessed_gender[[i]] <- NA
+  })
+}
+
+#Saving data in the data frame
+static_names$guessed_gender <- guessed_gender
+```
