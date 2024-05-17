@@ -1,0 +1,91 @@
+```{r}
+install.packages(c("statnet", "tidyverse"))
+library(statnet)
+library(tidyverse)
+```
+
+```{r}
+df <- read.csv("network_data/full_network_dataframe.csv")
+
+#step 1: filter to anyone who has been on more than 1 episode
+number_of_shows <- df %>% 
+    group_by(final_name) %>% 
+    arrange(Full.Date) %>% 
+    arrange(final_name) %>% 
+    select(-c(X)) %>% 
+    unique(.) %>% 
+    count(final_name) %>% filter(n>1)
+
+# filtering full df down to those who have appeared more than once on a podcast or podcasts
+multiple_shows <- semi_join(df, 
+                            number_of_shows, 
+                            by = "final_name") %>%
+                  group_by(final_name) %>% 
+                  arrange(Full.Date) %>% 
+                  arrange(final_name) %>%
+                  select(-c(X))
+
+#grouping df by guest name, then arranging by date
+#after, if they appeared on multiple shows on the same date, collapsing those shows down to one row
+cdf <- multiple_shows %>% 
+    group_by(final_name, Full.Date) %>%
+    arrange(Full.Date) %>% 
+    arrange(final_name) %>%
+    summarise(Show.Name = paste(Show.Name, collapse = ", ")) #%>%
+    #select(c("Show.Name")) %>% 
+   # .[-1,]
+
+# Grab the show name row and drop the last row
+show_name1 <- cdf %>% 
+            group_by(final_name) %>% 
+            slice(., 1:(n()-1)) %>% 
+            select(c("Show.Name"))
+
+# Get the second show name set up
+show_name2 <- cdf %>% 
+            group_by(final_name) %>% 
+            slice(., 2:n()) %>% 
+            select(c("Show.Name"))
+
+#selecting for anyone who has been on at least two episodes
+edgelist_one_plus_show <- data.frame(show_name1, show_name2) %>% 
+            group_by(final_name) %>%
+            separate_rows(. ,4, sep = ", ") %>% 
+            separate_rows(. ,2, sep = ", ")
+
+#anyone who has been on at least two SHOWs, then counting # of appearances between said shows
+edgelist_two_plus_shows <- edgelist_one_plus_show %>% 
+                           filter(Show.Name != Show.Name.1) %>% 
+                           select(c(Show.Name, Show.Name.1)) %>% 
+                           ungroup(.) %>% 
+                           select(-c(final_name)) %>% 
+                          count(Show.Name, Show.Name.1)
+
+```
+
+### Hmmm... what if we find out the extent to which heavy hitters influence the entailment analysis?
+
+```{r}
+l <- edgelist_one_plus_show %>% 
+                           filter(Show.Name != Show.Name.1) %>% 
+                           select(c(Show.Name, Show.Name.1)) %>%
+                           count(final_name) %>% arrange(-n) %>%
+                           filter(n < 16) %>%
+                           select(final_name)
+
+l2 <- edgelist_one_plus_show %>% 
+                           filter(Show.Name != Show.Name.1) %>% 
+                           select(c(Show.Name, Show.Name.1))
+
+l3 <- l2[l2$final_name %in% l$final_name,2:3] %>% count(Show.Name, Show.Name.1)
+```
+
+## Write data to RDS
+```{r}
+tn <- as.network(edgelist_two_plus_shows)
+#saveRDS(tn, "entailment_edgelist.rds")
+
+tn_average <- as.network(l3)
+#saveRDS(tn_average, "entailment_edgelist_no_heavyhitters.rds")
+```
+
